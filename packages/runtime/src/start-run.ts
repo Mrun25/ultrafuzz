@@ -620,7 +620,9 @@ async function submitSmithersContinuation(input: WorkflowLifecycleInput) {
     const agentRefs = tasks.flatMap((task) => task.agentChain.map((profile) => profile.agentRef));
     const providerCredentialNames = agentCredentialEnvironmentVariableNames(config, agentRefs);
     const continuedEnvironment =
-      input.refreshController === true ? trustedCli.env : withoutSensitiveAllowlistedEnvironment(trustedCli.env);
+      input.refreshController === true
+        ? trustedCli.env
+        : withoutSensitiveAllowlistedEnvironment(trustedCli.env, providerCredentialNames);
     const lifecycleEnvironment = {
       ...process.env,
       ...providerScopedControllerEnvironment(continuedEnvironment, providerCredentialNames)
@@ -2006,14 +2008,18 @@ function providerScopedControllerEnvironment(
 }
 
 function withoutSensitiveAllowlistedEnvironment(
-  source: Record<string, string | undefined>
+  source: Record<string, string | undefined>,
+  providerCredentialNames: readonly string[]
 ): Record<string, string | undefined> {
   const sanitized = { ...source };
   const sensitiveNames = new Set(
     sensitiveAllowlistedEnvironmentVariableNames(source).map((name) => name.toUpperCase())
   );
+  // Selected adapters consume these credentials through their configured authentication,
+  // independently of the allowlist. Removing a redundant allowlist entry must not erase them.
+  const providerNames = new Set(providerCredentialNames.map((name) => name.toUpperCase()));
   for (const name of Object.keys(sanitized)) {
-    if (sensitiveNames.has(name.toUpperCase())) sanitized[name] = undefined;
+    if (sensitiveNames.has(name.toUpperCase()) && !providerNames.has(name.toUpperCase())) sanitized[name] = undefined;
   }
   sanitized.ULTRAFUZZ_AGENT_ENV_ALLOWLIST = (source.ULTRAFUZZ_AGENT_ENV_ALLOWLIST ?? "")
     .split(",")

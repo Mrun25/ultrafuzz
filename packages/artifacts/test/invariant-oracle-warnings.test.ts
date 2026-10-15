@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { INVARIANT_ORACLE_GATE, invariantOracleWarnings } from "../src/index.js";
+import {
+  INVARIANT_ORACLE_GATE,
+  MAX_ARTIFACT_VALIDATION_WARNINGS,
+  MAX_ARTIFACT_VALIDATION_WARNING_BYTES,
+  invariantOracleWarnings
+} from "../src/index.js";
 
 function warningsFor(files: Record<string, string>): Array<{ code: string; path: string; line: string }> {
   return invariantOracleWarnings(new Map(Object.entries(files).map(([path, text]) => [path, Buffer.from(text)]))).map(
@@ -50,6 +55,71 @@ contract TargetFunctions {
 
 test("a falsifiable invariant suite produces no oracle warnings (#687)", () => {
   assert.deepEqual(warningsFor({ "invariant-suite/test/recon/TargetFunctions.sol": FALSIFIABLE_SUITE }), []);
+});
+
+test("constant comparisons preserve string literals and ignore punctuation inside them", () => {
+  const source = `contract Properties {
+    function property_strings() public {
+        assert(keccak256("a") == keccak256("b"));
+        assertEq("a b", "ab");
+        assertEq("a,b", "a)c");
+        assertEq("assert(true)", "assert(false)");
+        assertEq("a\\"b", "a\\"c");
+        assertEq('a', 'b');
+        assert(keccak256("same") == keccak256("same"));
+        assertEq("a,b", "a,b");
+    }
+}`;
+  assert.deepEqual(
+    warningsFor({ "invariant-suite/test/Properties.sol": source }).map(({ code, line }) => ({ code, line })),
+    [
+      { code: "INVARIANT_ORACLE_CONSTANT_TRUE", line: "line 9" },
+      { code: "INVARIANT_ORACLE_CONSTANT_TRUE", line: "line 10" }
+    ]
+  );
+});
+
+test("constant comparisons treat matching literal contents as equal across quote styles", () => {
+  const source = `contract Properties {
+    function property_strings() public {
+        assertEq("a", 'a');
+        assert(keccak256("a") == keccak256('a'));
+        assertEq("a,b", 'a,b');
+        assertEq("a", 'b');
+        assert(keccak256("a") == keccak256('b'));
+        assertEq("a,b", 'a)c');
+    }
+}`;
+  assert.deepEqual(
+    warningsFor({ "invariant-suite/test/Properties.sol": source }).map(({ code, line }) => ({ code, line })),
+    [
+      { code: "INVARIANT_ORACLE_CONSTANT_TRUE", line: "line 3" },
+      { code: "INVARIANT_ORACLE_CONSTANT_TRUE", line: "line 4" },
+      { code: "INVARIANT_ORACLE_CONSTANT_TRUE", line: "line 5" }
+    ]
+  );
+});
+
+test("production implementation imports support either Solidity quote style", () => {
+  for (const quote of ['"', "'"]) {
+    const source = `import {MathLib as ML} from ${quote}contracts/MathLib.sol${quote};
+import * as Math from ${quote}../src/Math.sol${quote};
+import {Test} from ${quote}forge-std/Test.sol${quote};
+contract Properties {
+    function property_expected() public {
+        assert(observed == ML.f(x));
+        assertEq(observed, Math.f(x));
+        assertEq(observed, Test.f(x));
+    }
+}`;
+    assert.deepEqual(
+      warningsFor({ "invariant-suite/test/Properties.sol": source }).map(({ code, line }) => ({ code, line })),
+      [
+        { code: "INVARIANT_ORACLE_IMPLEMENTATION_CALL", line: "line 6" },
+        { code: "INVARIANT_ORACLE_IMPLEMENTATION_CALL", line: "line 7" }
+      ]
+    );
+  }
 });
 
 test("invariant oracle warnings name each check Recon cannot fail (#687)", () => {
@@ -155,4 +225,34 @@ test("a catch that only rethrows is an oracle warning", () => {
     warningsFor({ "invariant-suite/test/C.sol": handler }).map(({ code }) => code),
     ["INVARIANT_ORACLE_BLANKET_CATCH"]
   );
+});
+
+test("dense suites stop scanning at the warning budget without inventing an omitted count", () => {
+  const artifactPath = "invariant-suite/test/a-λ.sol";
+  const source = (count: number) =>
+    Buffer.from(`contract C {\nfunction property() public {\n${"assert(true);\n".repeat(count)}}\n}\n`);
+  const unreadable = new Proxy(Buffer.from("assert(true);"), {
+    get() {
+      throw new Error("a source after the exhausted warning budget must not be read");
+    }
+  });
+  const warnings = invariantOracleWarnings(
+    new Map([
+      [artifactPath, source(100_000)],
+      ["invariant-suite/test/z.sol", unreadable]
+    ])
+  );
+  assert.ok(warnings.length <= MAX_ARTIFACT_VALIDATION_WARNINGS);
+  assert.ok(Buffer.byteLength(JSON.stringify(warnings)) <= MAX_ARTIFACT_VALIDATION_WARNING_BYTES);
+  assert.equal(warnings.at(-1)?.code, "ARTIFACT_VALIDATION_WARNINGS_TRUNCATED");
+  assert.match(warnings.at(-1)?.message ?? "", /scanning stopped/u);
+  assert.doesNotMatch(warnings.at(-1)?.message ?? "", /\d+ further/u);
+  const retained = warnings.slice(0, -1);
+  assert.ok(retained.length > 0);
+  for (const [index, warning] of retained.entries()) {
+    assert.equal(warning.code, "INVARIANT_ORACLE_CONSTANT_TRUE");
+    assert.equal(warning.field_path, `line ${String(index + 3)}`);
+  }
+  // Exhausting the input exactly at the retained prefix needs no truncation notice.
+  assert.deepEqual(invariantOracleWarnings(new Map([[artifactPath, source(retained.length)]])), retained);
 });

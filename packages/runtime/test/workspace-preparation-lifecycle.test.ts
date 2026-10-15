@@ -22,6 +22,7 @@ type Task = {
   attemptId: string;
   artifactDir: string;
   runRoot: string;
+  executionSnapshotRoot?: string;
   workspacePath: string;
   productionSourceRoots: string[];
   dependencyArtifactDirs: string[];
@@ -86,7 +87,11 @@ function preparationHarness(
   options: {
     rejectAdmission?: boolean;
     onPreflight?: () => void;
-    onPinnedSubmodules?: (step: "hydrate" | "verify", expectation: unknown) => void;
+    onPinnedSubmodules?: (
+      step: "hydrate" | "verify",
+      expectation: unknown,
+      source: { runRoot?: string; executionSnapshotRoot?: string }
+    ) => void;
     frictionLog?: { instructions: string; entriesPath: string; commandPath: string; wrapper: string };
   } = {}
 ) {
@@ -119,7 +124,7 @@ function preparationHarness(
     if (!ts.isVariableStatement(statement)) return [];
     const names = statement.declarationList.declarations.map((entry) => entry.name.getText(source));
     const included = names.every((name) =>
-      /^(?:INVARIANT_|MAX_INVARIANT_|WORKSPACE_|MAX_PRE_AGENT_|MAX_VERIFIED_|ARTIFACT_VERIFICATION_|invariantSuite.*(?:Snapshots|Ids|Tombstones)$|workspacePatch.*Trees$|dependencyArtifactAdmissionsByTask$|authenticatedAggregationSourcesByTask$|runtimePromptRenderFailures$|taskPromptReadFailures$)/u.test(
+      /^(?:INVARIANT_|MAX_INVARIANT_|WORKSPACE_|MAX_PRE_AGENT_|MAX_VERIFIED_|ARTIFACT_VERIFICATION_|invariantSuite.*(?:Snapshots|Ids|Tombstones)$|workspacePatch.*Trees$|dependencyArtifactAdmissionsByTask$|dependencyChangesByTask$|dependencyHydrationUnavailableByTask$|authenticatedAggregationSourcesByTask$|runtimePromptRenderFailures$|taskPromptReadFailures$)/u.test(
         name
       )
     );
@@ -151,10 +156,20 @@ function preparationHarness(
       }
     },
     taskSpecs: tasks,
-    hydratePinnedSubmodulesFromExecutionSnapshot: (input: { expectation: unknown }) =>
-      options.onPinnedSubmodules?.("hydrate", input.expectation),
-    verifyPinnedSubmodulesFromExecutionSnapshot: (input: { expectation: unknown }) =>
-      options.onPinnedSubmodules?.("verify", input.expectation)
+    // The stubs below ignore the source root the template passes as `sourceRoot`.
+    sourceProjectRoot: "/",
+    hydrateTaskSubmodules: (input: { expectation: unknown; runRoot?: string; executionSnapshotRoot?: string }) => {
+      options.onPinnedSubmodules?.("hydrate", input.expectation, input);
+      return undefined;
+    },
+    checkTaskSubmodulesAfterAgent: (input: {
+      expectation: unknown;
+      runRoot?: string;
+      executionSnapshotRoot?: string;
+    }) => {
+      options.onPinnedSubmodules?.("verify", input.expectation, input);
+      return undefined;
+    }
   };
   for (const name of localConstants) Reflect.deleteProperty(collaborators, name);
   return new Function(
@@ -599,11 +614,16 @@ test("the post-agent verify pass checks the task's pinned submodules and does no
     const submoduleSteps: Array<[string, unknown]> = [];
     const pinnedSubmodules = { submodules: [{ path: "lib/forge-std", commit: "a".repeat(40) }] };
     fixture.task.pinnedSubmodules = pinnedSubmodules;
+    fixture.task.executionSnapshotRoot = path.join(fixture.task.runRoot, "historical-snapshot");
     const harness = preparationHarness(fixture.tasks, {
       onPreflight: () => {
         preflights += 1;
       },
-      onPinnedSubmodules: (step, expectation) => submoduleSteps.push([step, expectation])
+      onPinnedSubmodules: (step, expectation, source) => {
+        submoduleSteps.push([step, expectation]);
+        assert.equal(source.runRoot, fixture.task.runRoot);
+        assert.equal(source.executionSnapshotRoot, fixture.task.executionSnapshotRoot);
+      }
     });
     // prepare:* and the reset before each agent attempt run ahead of an agent that uses the CLI.
     harness.prepare(fixture.task);

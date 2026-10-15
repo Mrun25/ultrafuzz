@@ -2653,7 +2653,7 @@ function writeRequiredArtifactSet(runRoot: string, nodeId: string, required: str
   writeCurrentArtifactVerificationMarker(runRoot, nodeId);
 }
 
-function writeEmptyFinalReportArtifactSet(runRoot: string, runId: string) {
+function writeEmptyFinalReportArtifactSet(runRoot: string, runId: string, attemptId = "final-report") {
   const finalReport = projectCanonicalFinalReport({
     schema_version: "ultrafuzz.report.v3",
     run_metadata: {
@@ -2681,11 +2681,11 @@ function writeEmptyFinalReportArtifactSet(runRoot: string, runId: string) {
       reason: "property-implementation-track-not-declared"
     }
   });
-  const reportDir = path.join(runRoot, "artifacts", "final-report");
+  const reportDir = path.join(runRoot, "artifacts", attemptId);
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, "report.json"), `${JSON.stringify(finalReport.report, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, "report.md"), finalReport.markdown);
-  writeCurrentArtifactVerificationMarker(runRoot, "final-report");
+  writeCurrentArtifactVerificationMarker(runRoot, attemptId);
   return finalReport;
 }
 
@@ -11215,7 +11215,12 @@ test("compileSmithersWorkflow marks specialist attempts and their artifact hando
     { attemptId: "direct-strategy", verifierId: "verify:direct-strategy", optional: false },
     { attemptId: "optional-specialist", verifierId: "verify:optional-specialist", optional: true }
   ]);
-  assert.equal(workflowSource.match(/continueOnFail=\{task\.continueOnFail\}/gu)?.length, 3);
+  assert.equal(workflowSource.match(/continueOnFail=\{task\.continueOnFail\}/gu)?.length, 2);
+  // The report verifier also tolerates failure, so a secret-gate rejection withholds the report (#1217).
+  assert.equal(
+    workflowSource.match(/continueOnFail=\{task\.continueOnFail \|\| producesFinalReport\(task\)\}/gu)?.length,
+    1
+  );
 });
 
 test("current-controller rendering reapplies continue policy and optional dependencies", async () => {
@@ -19902,15 +19907,15 @@ test("syncRun publishes a report after a resumed report agent succeeds", async (
 });
 
 for (const variant of ["secret-gate", "other-verifier-failure", "require-complete"] as const) {
-  test(`syncRun records secret-gate rejection without changing completion policy (#1217, ${variant})`, async () => {
+  test(`syncRun withholds a report the secret gate rejects instead of failing the run (#1217, ${variant})`, async () => {
     const { readReportPublicationStatus } = await import("../src/report-publication-status.js");
     const project = tempProject();
     initProject({ projectRoot: project, force: true });
     writeSingleFinalReportTopology(project);
     const runId = `sync-withheld-report-${variant}`;
     const workflowRunId = `ultrafuzz-${runId}`;
-    // Even a runner that tolerated the wrapper failure must not override
-    // this required report node's failed completion status.
+    // The verifier task tolerates failure, so the runner ends the run
+    // succeeded-with-failures whatever rejected the report.
     const verifierError =
       variant === "other-verifier-failure"
         ? { name: "Error", message: "artifact-contract failure: report parity failed" }
@@ -19975,12 +19980,12 @@ for (const variant of ["secret-gate", "other-verifier-failure", "require-complet
       ),
       JSON.stringify(sync.diagnostics)
     );
-    assert.equal(sync.value?.status, "failed", JSON.stringify(sync.diagnostics));
-    // Both default and strict completion retain the report node's failure.
+    // Strict completion still treats the missing report as an unsuccessful run.
     if (variant === "require-complete") {
       assert.equal(sync.value?.status, "failed");
       return;
     }
+    assert.equal(sync.value?.status, "succeeded", JSON.stringify(sync.diagnostics));
 
     // `resume --retry-failed` reruns the report task; its accepted output is published.
     const recoveredEnv = fakeLifecycleSmithersEnv(project, {
@@ -20009,6 +20014,85 @@ for (const variant of ["secret-gate", "other-verifier-failure", "require-complet
     assert.equal(recovered.value?.status, "succeeded", JSON.stringify(recovered.diagnostics));
     assert.equal(readRunState(path.join(runRoot, "state.json")).nodes["final-report"]?.status, "succeeded");
     assert.equal(loadCurrentFinalReportSnapshot(runRoot).artifacts.source, "verified-runtime-report");
+  });
+}
+
+for (const variant of ["all-withheld", "successful-sibling", "ordinary-failure", "require-complete"] as const) {
+  test(`syncRun preserves withheld-report completion policy across model fanout (${variant})`, async () => {
+    const project = tempProject();
+    initProject({ projectRoot: project, force: true });
+    writeSingleFinalReportTopology(project);
+    const topologyPath = path.join(project, ".ultrafuzz", "topology.yml");
+    fs.writeFileSync(
+      topologyPath,
+      fs
+        .readFileSync(topologyPath, "utf8")
+        .replace(
+          "    prompt: setup/project-discovery.md\n",
+          "    prompt: setup/project-discovery.md\n    model_profiles: [default, claude]\n"
+        )
+    );
+    const runId = `withheld-fanout-${variant}`;
+    const workflowRunId = `ultrafuzz-${runId}`;
+    const env = fakeLifecycleSmithersEnv(project, {
+      inspect: workflowInspect({ workflowRunId, status: "running", state: "running", steps: [] })
+    });
+    const run = await startRun({
+      projectRoot: project,
+      runId,
+      env,
+      ...(variant === "require-complete"
+        ? { runtimeOverrides: { run: { completionPolicy: "require-complete" as const } } }
+        : {})
+    });
+    assert.ok(run.ok && run.value, JSON.stringify(run.diagnostics));
+    const runRoot = run.value.run_root;
+    const { tasks } = parseSmithersTaskManifestBytes(fs.readFileSync(path.join(runRoot, "smithers", "tasks.json")));
+    assert.equal(tasks.length, 2);
+    const [firstTask] = tasks;
+    assert.ok(firstTask);
+    const steps: Parameters<typeof workflowInspect>[0]["steps"] = [];
+    const events: Parameters<typeof workflowEvents>[1] = [];
+    for (const [index, task] of tasks.entries()) {
+      const succeeded = index === 1 && variant === "successful-sibling";
+      const ordinaryFailure = index === 1 && variant === "ordinary-failure";
+      steps.push(
+        { id: task.smithersNodeId, state: "finished", attempt: 1 },
+        { id: task.verifierSmithersNodeId, state: succeeded ? "finished" : "failed", attempt: 1 }
+      );
+      events.push(
+        { type: "NodeStarted", nodeId: task.smithersNodeId, attempt: 1 },
+        { type: "NodeFinished", nodeId: task.smithersNodeId, attempt: 1 },
+        succeeded
+          ? { type: "NodeFinished", nodeId: task.verifierSmithersNodeId, attempt: 1 }
+          : {
+              type: "NodeFailed",
+              nodeId: task.verifierSmithersNodeId,
+              attempt: 1,
+              error: ordinaryFailure
+                ? { message: "artifact-contract failure: report parity failed" }
+                : { message: "artifact publication contains sensitive data", code: "ARTIFACT_SECRET_GATE_REJECTED" }
+            }
+      );
+      if (succeeded) writeEmptyFinalReportArtifactSet(runRoot, runId, task.attemptId);
+    }
+    events.push({ type: "RunFinished" });
+    const terminalEnv = fakeLifecycleSmithersEnv(project, {
+      inspect: workflowInspect({ workflowRunId, status: "finished", state: "succeeded-with-failures", steps }),
+      events: workflowEvents(workflowRunId, events)
+    });
+    const expectedStatus = variant === "all-withheld" || variant === "successful-sibling" ? "succeeded" : "failed";
+    for (let pass = 0; pass < 2; pass += 1) {
+      const synced = await syncRun({ projectRoot: project, runId, env: terminalEnv });
+      assert.equal(synced.ok, true, JSON.stringify(synced.diagnostics));
+      assert.equal(synced.value?.status, expectedStatus, JSON.stringify(synced.diagnostics));
+      // A tolerated failure stays visible both on its attempt and its aggregate.
+      const state = readRunState(layoutForRunRoot(runRoot));
+      assert.equal(state.nodes[firstTask.attemptId]?.status, "failed");
+      assert.equal(state.nodes["final-report"]?.status, "failed");
+    }
+    if (variant === "successful-sibling") assert.ok(loadReportSnapshot(runRoot));
+    else assert.throws(() => loadReportSnapshot(runRoot), /Report unavailable/u);
   });
 }
 

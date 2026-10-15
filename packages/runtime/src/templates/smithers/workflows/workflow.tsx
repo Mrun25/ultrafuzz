@@ -1310,6 +1310,10 @@ function verifiedCanonicalPropertyCatalog(
   return { path: catalog.relativePath, value: parsed.value };
 }
 
+function producesFinalReport(task: (typeof taskSpecs)[number]): boolean {
+  return task.outputs.some((output) => output.contract === "ultrafuzz/report@3");
+}
+
 function declaredFinalReportOutputPair(task: (typeof taskSpecs)[number]):
   | {
       report: (typeof taskSpecs)[number]["outputs"][number];
@@ -9294,7 +9298,10 @@ export default smithers((ctx) => {
                 needs={{ agent: task.id }}
                 deps={{ agent: outputs.agentProcess }}
                 depsOptional
-                continueOnFail={task.continueOnFail}
+                // Let the runtime apply completion policy to a report the
+                // secret gate rejects (#1217). Strict completion and other
+                // report verification failures still fail the campaign.
+                continueOnFail={task.continueOnFail || producesFinalReport(task)}
                 retries={0}
                 metadata={{
                   category: "artifact-contract",

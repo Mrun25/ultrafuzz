@@ -173,10 +173,10 @@ version to the same advisory endpoint. This matters for the private workflow
 controller's pinned npm: pnpm otherwise reports npm as one opaque package and
 omits the packages npm ships inside itself. The lockfile-bound npm patch bundles
 `brace-expansion` 5.0.12, `ip-address` 10.5.0, `tar` 7.5.22, and `undici`
-6.28.1. The `ip-address` and `tar` versions mirror the green npm v11 upstream
+6.29.1. The `ip-address` and `tar` versions mirror the green npm v11 upstream
 fixes in `npm/cli#9842` and `npm/cli#9872`. No npm release yet bundles the
 `brace-expansion` and `undici` fixes for GHSA-6j4f-fj2g-mc7p,
-GHSA-qhr7-859c-m2p7, and GHSA-rfgv-xxqx-mfg5, so the patch carries those
+GHSA-qhr7-859c-m2p7, GHSA-rfgv-xxqx-mfg5, and GHSA-xjj6-f33q-929c, so the patch carries those
 registry releases, limited to the files npm's own bundling keeps.
 The patch can be removed when an upstream npm release carries those versions;
 the operator npm closure digest and advisory inventory both fail if that
@@ -186,6 +186,11 @@ the controller invokes npm's pinned CLI directly; the snapshot test also proves
 that no such shim directory is copied. Socket's duplicate obfuscated-code
 warnings refer to npm's official bundled/minified distribution; no warning is
 suppressed, and registry integrity plus the closure digest cover those bytes.
+
+The controller's generated `.smithers/package.json` is installed separately by
+npm, so it also pins the fixed MCP SDK, body-parser, DOMPurify, and Zod versions.
+Its fixed resolution cutoff follows those releases. Non-force init upgrades the
+exact prior generated manifest to the new pins while preserving project runs.
 
 ## Agent process environment
 

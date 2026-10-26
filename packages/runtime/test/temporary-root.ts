@@ -1,9 +1,11 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { TestContext } from "node:test";
 
 /**
- * Create a temporary directory for a test and remove it when the process exits.
+ * Create a temporary directory for a test and remove it after that test.
  *
  * Two problems are solved here that every fixture otherwise has to remember.
  *
@@ -17,20 +19,49 @@ import path from "node:path";
  * The root is removable. Sealed execution snapshots are left `dr-x------`, and
  * unlinking an entry needs the write bit on its parent rather than on the entry
  * itself, so `rmSync` cannot remove a tree that contains one. Owner write
- * permission is restored on directories on the way down, which is the same
- * treatment `restoreRemovableDirectoryPermissions` applies in `clean.ts`.
+ * permission is restored on directories on the way down. File modes do not
+ * affect unlinking, and a fixture file may be hard-linked outside scratch.
  */
-const registered: string[] = [];
+const registered = new Set<string>();
+const testRoots = new AsyncLocalStorage<string[]>();
 let exitHookInstalled = false;
 
-export function temporaryRoot(prefix: string): string {
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
-  registered.push(root);
+/** Attach roots created by a test body to its after hook, including on assertion failure. */
+export function withTemporaryRootScope(context: TestContext, body: () => void | Promise<void>): void | Promise<void> {
+  const roots: string[] = [];
+  return testRoots.run(roots, async () => {
+    try {
+      await body();
+    } finally {
+      // Register after the body so its own after hooks can still use the fixture.
+      context.after(() => removeRoots(roots));
+    }
+  });
+}
+
+export function temporaryRoot(prefix: string, lifetime: "test" | "process" = "test"): string {
+  let root: string;
+  try {
+    root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    if (failure.code === "ENOSPC" || failure.code === "EDQUOT" || failure.errno === -122) {
+      throw new Error(
+        `Runtime test scratch space or quota is exhausted (ENOSPC/EDQUOT) while creating ${prefix} in ${os.tmpdir()}`,
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+  registerTemporaryPath(root, lifetime);
+  return root;
+}
+
+function installExitHook(): void {
   if (!exitHookInstalled) {
     exitHookInstalled = true;
     process.on("exit", removeRegisteredRoots);
   }
-  return root;
 }
 
 /**
@@ -47,49 +78,55 @@ export function privateHomeEnv(): { HOME: string } {
  * rest. Fixtures that place a directory beside their root rather than inside it
  * are otherwise invisible to this module and survive the run.
  */
-export function registerTemporaryPath(directory: string): string {
-  registered.push(directory);
-  if (!exitHookInstalled) {
-    exitHookInstalled = true;
-    process.on("exit", removeRegisteredRoots);
-  }
+export function registerTemporaryPath(directory: string, lifetime: "test" | "process" = "test"): string {
+  registered.add(directory);
+  if (lifetime === "test") testRoots.getStore()?.push(directory);
+  installExitHook();
   return directory;
 }
 
-/** Remove every registered root. */
+function removeRoots(roots: string[]): void {
+  const errors: Error[] = [];
+  for (let root = roots.pop(); root !== undefined; root = roots.pop()) {
+    try {
+      removeTemporaryRoot(root);
+      registered.delete(root);
+    } catch (error) {
+      errors.push(error as Error);
+    }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "Failed to remove runtime test scratch directories");
+}
+
+/** Last resort for module-scoped fixtures and interrupted test cleanup. */
 function removeRegisteredRoots(): void {
-  for (let root = registered.pop(); root !== undefined; root = registered.pop()) removeTemporaryRoot(root);
+  for (const root of registered) {
+    try {
+      removeTemporaryRoot(root);
+    } catch (error) {
+      process.stderr.write(`Failed to remove runtime test scratch directory ${root}: ${String(error)}\n`);
+      process.exitCode = 1;
+    }
+  }
 }
 
 function removeTemporaryRoot(root: string): void {
-  restoreRemovableDirectoryPermissions(root);
-  try {
-    fs.rmSync(root, { recursive: true, force: true });
-  } catch {
-    // A test that deliberately locks a tree down is not worth failing the run.
-  }
+  restoreRemovablePermissions(root);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
-function restoreRemovableDirectoryPermissions(root: string): void {
+function restoreRemovablePermissions(root: string): void {
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(root);
-  } catch {
-    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
-  if (stat.isSymbolicLink() || !stat.isDirectory()) return;
-  try {
-    fs.chmodSync(root, stat.mode | 0o700);
-  } catch {
-    // Best effort: rmSync reports the actionable failure.
-  }
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return;
-  }
+  if (!stat.isDirectory()) return;
+  fs.chmodSync(root, stat.mode | 0o700);
+  const entries = fs.readdirSync(root, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.isDirectory()) restoreRemovableDirectoryPermissions(path.join(root, entry.name));
+    if (entry.isDirectory()) restoreRemovablePermissions(path.join(root, entry.name));
   }
 }

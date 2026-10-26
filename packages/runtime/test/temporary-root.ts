@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { TestContext } from "node:test";
+import { afterEach, beforeEach, type TestContext } from "node:test";
 
 /**
  * Create a temporary directory for a test and remove it after that test.
@@ -24,7 +24,76 @@ import type { TestContext } from "node:test";
  */
 const registered = new Set<string>();
 const testRoots = new AsyncLocalStorage<string[]>();
+type DirectTestScope = { roots: string[]; pending: boolean };
+const directTestScopes: DirectTestScope[] = [];
+const directTestContextScopes = new WeakMap<object, DirectTestScope>();
 let exitHookInstalled = false;
+
+function drainPendingDirectTestScopes(): void {
+  while (directTestScopes.at(-1)?.pending) {
+    const scope = directTestScopes.pop();
+    if (scope !== undefined) removeRoots(scope.roots);
+  }
+}
+
+function currentDirectTestRoots(): string[] | undefined {
+  // A child with a failed teardown remains pending while its parent body may
+  // resume. New parent fixtures belong to the nearest still-active ancestor.
+  for (let index = directTestScopes.length - 1; index >= 0; index -= 1) {
+    const scope = directTestScopes[index];
+    if (scope !== undefined && !scope.pending) return scope.roots;
+  }
+  return directTestScopes.at(-1)?.roots;
+}
+
+function scopeDirectAfterHooks(context: TestContext, scope: DirectTestScope): void {
+  const registerAfter = context.after.bind(context);
+  context.after = (callback, options) => {
+    if (callback === undefined) return registerAfter(undefined, options);
+    if (callback.length >= 2) {
+      return registerAfter(
+        (hookContext, done) => testRoots.run(scope.roots, () => callback(hookContext, done)),
+        options
+      );
+    }
+    return registerAfter((hookContext) => testRoots.run(scope.roots, () => callback(hookContext, () => {})), options);
+  };
+}
+
+// Supporting files run under Node's test runner, which isolates each file.
+// Bun caches this helper across files, so hooks registered by one import would
+// not cover direct tests in later files. Bun's runtime lane uses the scoped
+// wrapper below instead. Node's beforeEach async context does not reach the
+// test body, so track serial direct tests until their after hooks finish.
+if (process.versions.bun === undefined) {
+  beforeEach((context) => {
+    // An earlier teardown hook can throw before our late context.after runs.
+    drainPendingDirectTestScopes();
+    const scope = { roots: [], pending: false };
+    scopeDirectAfterHooks(context as TestContext, scope);
+    directTestContextScopes.set(context, scope);
+    directTestScopes.push(scope);
+  });
+
+  afterEach((context) => {
+    // A nested child can leave its pending scope above the active parent.
+    drainPendingDirectTestScopes();
+    const scope = directTestContextScopes.get(context);
+    if (scope === undefined) return;
+    if (directTestScopes.at(-1) !== scope) {
+      throw new Error("Runtime test scratch scopes overlap; run these tests without test concurrency");
+    }
+    if (!("after" in context)) throw new Error("Runtime test scratch cleanup requires a test context");
+    scope.pending = true;
+    context.after(() => {
+      if (directTestScopes.at(-1) !== scope) {
+        throw new Error("Runtime test scratch scopes overlap; run these tests without test concurrency");
+      }
+      directTestScopes.pop();
+      removeRoots(scope.roots);
+    });
+  });
+}
 
 /** Attach roots created by a test body to its after hook, including on assertion failure. */
 export function withTemporaryRootScope(context: TestContext, body: () => void | Promise<void>): void | Promise<void> {
@@ -80,7 +149,7 @@ export function privateHomeEnv(): { HOME: string } {
  */
 export function registerTemporaryPath(directory: string, lifetime: "test" | "process" = "test"): string {
   registered.add(directory);
-  if (lifetime === "test") testRoots.getStore()?.push(directory);
+  if (lifetime === "test") (testRoots.getStore() ?? currentDirectTestRoots())?.push(directory);
   installExitHook();
   return directory;
 }

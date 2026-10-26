@@ -3493,6 +3493,16 @@ function materializeWorkspacePatchDependencies(
     throw new Error(`artifact-contract failure: workspace preparation was modified ${task.attemptId}`);
   }
   const captures = authenticatedWorkspacePatchCaptures(task, workspaceRoot);
+  // A retained v1 dependency can contain a path a newer runtime excludes from
+  // new captures. Preserve authenticated membership through every tree check,
+  // including resumed-prefix selection and the next producer's baseline.
+  const treeAuthority = {
+    trees: [
+      ...captures.map((capture) => capture.manifest.base_tree),
+      ...(persistedPreparation === undefined ? [] : [persistedPreparation])
+    ],
+    files: captures.flatMap((capture) => capture.manifest.files)
+  };
   // On a RESUME the worktree lives on a durable volume and still holds the previous attempt's state, so it
   // can already sit at -- or past -- some of these dependencies' outputs. Skip the prefix the worktree
   // already holds (issue #312). On a fresh run at the pinned baseline nothing normally matches, though a
@@ -3501,7 +3511,7 @@ function materializeWorkspacePatchDependencies(
   const replayFrom =
     replayWorkspacePatches && captures.length > 0
       ? firstDependencyRequiringReplay(
-          captureWorkspaceTree(workspaceRoot),
+          captureWorkspaceTree(workspaceRoot, treeAuthority),
           captures.map((entry) => entry.manifest)
         )
       : 0;
@@ -3511,7 +3521,7 @@ function materializeWorkspacePatchDependencies(
       // exact dependency result tree is absent and the clean base tree is
       // still present; otherwise the dependency patch is already represented
       // by the dirty workspace and must not be applied over agent changes.
-      const currentTree = captureWorkspaceTree(workspaceRoot);
+      const currentTree = captureWorkspaceTree(workspaceRoot, treeAuthority);
       if (currentTree !== capture.manifest.base_tree) continue;
     }
     applyWorkspacePatch(workspaceRoot, capture, task.productionSourceRoots);
@@ -3520,7 +3530,7 @@ function materializeWorkspacePatchDependencies(
     writeWorkspacePreparationAuthority(
       task.runRoot,
       task.attemptId,
-      captureWorkspaceTree(workspaceRoot),
+      captureWorkspaceTree(workspaceRoot, treeAuthority),
       admittedWorkspacePreparationDependencyDigest(task)
     );
   }
@@ -3528,7 +3538,7 @@ function materializeWorkspacePatchDependencies(
     if (persistedPreparation === undefined && evidenceMode === "require") {
       throw new Error(`artifact-contract failure: workspace preparation is unavailable ${task.attemptId}`);
     }
-    const preparationTree = persistedPreparation ?? captureWorkspaceTree(workspaceRoot);
+    const preparationTree = persistedPreparation ?? captureWorkspaceTree(workspaceRoot, treeAuthority);
     workspacePatchPreparationTrees.set(task.attemptId, preparationTree);
     if (persistedPreparation === undefined && evidenceMode === "create") {
       writeWorkspacePatchPreparation(task, preparationTree);
@@ -3546,7 +3556,7 @@ function materializeWorkspacePatchDependencies(
     if (persistedBaseline === undefined && evidenceMode === "require") {
       throw new Error(`artifact-contract failure: workspace patch baseline is unavailable ${task.attemptId}`);
     }
-    const baselineTree = persistedBaseline ?? captureWorkspaceTree(workspaceRoot);
+    const baselineTree = persistedBaseline ?? captureWorkspaceTree(workspaceRoot, treeAuthority);
     workspacePatchBaselineTrees.set(task.attemptId, baselineTree);
     if (persistedBaseline === undefined && evidenceMode === "create") {
       writeWorkspacePatchBaseline(task, baselineTree);
@@ -4005,7 +4015,7 @@ function replaceSupersededWorkspacePreparation(
       restoreWorkspaceTreeWithIndexLockRecovery(workspaceRoot, base);
       removeStaleWorkspaceFiles(workspaceRoot, base);
       for (const capture of captures) applyWorkspacePatch(workspaceRoot, capture, task.productionSourceRoots);
-      if (captureWorkspaceTree(workspaceRoot) !== replacementTree) {
+      if (captureWorkspaceTree(workspaceRoot, { trees: [replacementTree] }) !== replacementTree) {
         throw new Error(
           `artifact-contract failure: replacement workspace preparation result changed ${task.attemptId}`
         );

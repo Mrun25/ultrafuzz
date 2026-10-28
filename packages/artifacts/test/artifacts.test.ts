@@ -280,6 +280,35 @@ function failedAttemptInput(id: string, failureMessage: string) {
   };
 }
 
+test("failure-message normalization replaces C1 and bidirectional controls", () => {
+  const ranges = [
+    [0x80, 0x9f],
+    [0x202a, 0x202e],
+    [0x2066, 0x2069]
+  ];
+  for (const [first, last] of ranges) {
+    for (let codePoint = first!; codePoint <= last!; codePoint += 1) {
+      const control = String.fromCodePoint(codePoint);
+      assert.equal(normalizeNodeAttemptFailureMessage(`left${control}right`), "left right", codePoint.toString(16));
+      assert.equal(normalizeNodeAttemptFailureMessage(control), undefined, codePoint.toString(16));
+    }
+  }
+  assert.equal(normalizeNodeAttemptFailureMessage("café λ مرحبا 🚀"), "café λ مرحبا 🚀");
+});
+
+test("normalized control text is persisted and replayed without changing ledger bytes", () => {
+  const layout = createRunLayout({ projectRoot: tempProject(), runId: "normalized-control-text" });
+  const input = failedAttemptInput("controls", "left\u009bright\u202etail\u2066end");
+  const first = appendNodeAttempt(layout, input);
+  assert.equal(first.entry.failure_message, "left right tail end");
+  assert.equal(queryNodeAttempts(layout)[0]?.failure_message, "left right tail end");
+  const bytes = fs.readFileSync(layout.attemptLedgerPath);
+  const replay = appendNodeAttempt(layout, input);
+  assert.equal(replay.appended, false);
+  assert.deepEqual(replay.entry, first.entry);
+  assert.deepEqual(fs.readFileSync(layout.attemptLedgerPath), bytes);
+});
+
 test("node attempt ledger records an occurrence once and never re-derives it", () => {
   const layout = createRunLayout({ projectRoot: tempProject(), runId: "attempt-ledger-redacted-replay" });
   const oldCredential = "correct horse battery staple";

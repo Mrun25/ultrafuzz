@@ -564,7 +564,12 @@ function normalizeNodeAttemptFailureText(value: string): string | undefined {
   const normalized = [...value]
     .map((character) => {
       const codePoint = character.codePointAt(0)!;
-      return codePoint <= 31 || codePoint === 127 ? " " : character;
+      return codePoint <= 31 ||
+        (codePoint >= 127 && codePoint <= 159) ||
+        (codePoint >= 0x202a && codePoint <= 0x202e) ||
+        (codePoint >= 0x2066 && codePoint <= 0x2069)
+        ? " "
+        : character;
     })
     .join("")
     .replace(/\s+/gu, " ")

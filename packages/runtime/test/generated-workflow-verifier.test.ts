@@ -8371,7 +8371,7 @@ test("generated Smithers pinned source proof counts hidden unreachable commits w
       stdio: ["ignore", "pipe", "pipe"]
     }).trim();
   try {
-    git(["init", "--quiet"]);
+    git(["init", "--quiet", "--initial-branch=master"]);
     git(["config", "user.name", "Ultrafuzz test"]);
     git(["config", "user.email", "test@example.invalid"]);
     fs.writeFileSync(path.join(root, "source.txt"), "pinned\n");
